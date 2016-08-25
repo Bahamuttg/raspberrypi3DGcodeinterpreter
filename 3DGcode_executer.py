@@ -2,8 +2,11 @@ import RPi.GPIO as GPIO
 import Motor_control_new
 from Bipolar_Stepper_Motor_Class_new import Bipolar_Stepper_Motor
 import time
-from numpy import pi, sin, cos, sqrt, arccos, arcsin
+from numpy import pi, sin, cos, sqrt, arccos, arcsin, log
 from collections import deque
+import Adafruit_GPIO.SPI as SPI
+import Adafruit_MCP3008
+
 
 ################################################################################################
 ################################################################################################
@@ -13,12 +16,12 @@ from collections import deque
 ################################################################################################
 ################################################################################################
 
-filename='pizero-scover.gcode'; #file name of the G code commands
+filename='Gcode/cube20hole.gcode'; #file name of the G code commands
 
 GPIO.setmode(GPIO.BCM)
 print GPIO.VERSION
 MX=Bipolar_Stepper_Motor(17,4);     #pin number for a1,a2,b1,b2.  a1 and a2 form coil A; b1 and b2 form coil B
-MY=Bipolar_Stepper_Motor(23,18);       
+MY=Bipolar_Stepper_Motor(23,18);
 MZ=Bipolar_Stepper_Motor(24,25);
 MExt=Bipolar_Stepper_Motor(27,22);
 #TODO EndStop/Home Axis code needed still testing they should be tied to the enable pins of each motor
@@ -27,21 +30,40 @@ EndStopY = 15
 EndStopZ = 7
 ExtHeater = 10
 HeatBed = 9
-ExtThermistor = 11
-HeatBedThermistor = 8
+#ExtThermistor = 11
+#HeatBedThermistor = 8
 #note only can set lists with 0.5.8 and above version of RPi.GPIO orginal PI caps out at 0.5.5?
 outputs = [ExtHeater,HeatBed];
-inputs = [ExtThermistor,HeatBedThermistor,EndStopX,EndStopY,EndStopZ];
+inputs = [EndStopX,EndStopY,EndStopZ];
 
+# Software SPI configuration for MCP3008 ADC Chip:
+#Extruder is Channel 0
+#Heat Bed is Channel 1
+CLK  = 8
+MISO = 11
+MOSI = 2
+CS   = 3
+mcp = Adafruit_MCP3008.MCP3008(clk=CLK, cs=CS, miso=MISO, mosi=MOSI)
+extChannel = 0
+heatBedChannel = 1
 
-dx=0.205; #resolution in x direction. Unit: mm  http://prusaprinters.org/calculator/
-dy=0.205; #resolution in y direction. Unit: mm  http://prusaprinters.org/calculator/
+#   Therm Specs: Honeywell 135-103LAF-J01
+#   Resistance @ 25C = 10K Ohms
+#   Beta = 3974 @ 0C/50C
+#
+#   25 C = 298.15 K
+ThermBeta = 3974
+ThermDefaultTempK = 298.15
+ThermDefaultRes = 10000
+
+dx=0.2; #resolution in x direction. Unit: mm  http://prusaprinters.org/calculator/
+dy=0.2; #resolution in y direction. Unit: mm  http://prusaprinters.org/calculator/
 dz=0.004; #resolution in Z direction. Unit: mm  http://prusaprinters.org/calculator/
 dext=0.038; # resolution for Extruder Unit: mm http://forums.reprap.org/read.php?1,144245
 
 
 #Engraving_speed=40; #unit=mm/sec=0.04in/sec
-Engraving_speed=20;
+Engraving_speed=25;
 
 extTemp = 0; #global variable for current tempurature settings
 heatBedTemp = 0;
@@ -77,24 +99,32 @@ def writeToLog(outputText):
     print outputText
 
 #these functions are for debugging purposes only
-def sampleHeaters(extThermPin,heatbeadThermPin):
-    sampleHeaterDutyCycle(extThermPin, "Extruder")
-    sampleHeaterDutyCycle(heatbeadThermPin, "Heated Bed")
+def sampleHeaters(extThermChannel,heatbeadThermChannel):
+    sampleHeaterTemp(extThermChannel, "Extruder")
+    sampleHeaterTemp(heatbeadThermChannel, "Heated Bed")
 
-def sampleHeaterDutyCycle(pin, name):
+def sampleHeaterTemp(channel, name):
     writeToLog("Testing "+ name +" Temperature\n");
-    highTime = get555PulseHighTime(pin);
-    writeToLog(name+ " Thermistor 555 Timer High Pulse Time "+ str(highTime)+"\n")
-    estTemp = getTempFromTable(pin)
+    #highTime = get555PulseHighTime(pin);
+    #writeToLog(name+ " Thermistor 555 Timer High Pulse Time "+ str(highTime)+"\n")
+    estTemp = getTempAtADCChannel(channel)
     writeToLog(name+ " Estimated Tempurature "+ str(estTemp)+"\n")
-    
-def get555PulseHighTime(pin):
-    counter = 0;
-    GPIO.wait_for_edge(pin, GPIO.RISING);
-    while GPIO.input(pin) == GPIO.HIGH:
-        counter += 1;
-        time.sleep(0.001); # may try to change this to 0.0001 for more resolution
-    return float(counter);
+
+#function to read ADC channel value and calcuate tempurature of thermistor
+#Values:
+#   Vin = 3.3V
+#   Vout = 3.3V(ADC Value/1024)
+#   R1 = 1K Ohms
+#   R2 = thermRes = Estimated Thermistor Resistance
+#
+#   Beta = 3974 @ 0C/50C
+#
+#   25 C = 298.15 K
+def getTempAtADCChannel(channel):
+    adcVal = mcp.read_adc(channel);
+    Vout = 3.3 * (float(adcVal)/1024);
+    thermRes = (Vout * 1000)/(3.3 - Vout);
+    return ((ThermDefaultTempK * ThermBeta) / log(ThermDefaultRes/thermRes) / (ThermBeta /  log(ThermDefaultRes/thermRes) - ThermDefaultTempK) - 273.15);
 
 #This function takes in the current temp and name of heater and returns the current average  
  #of the last three tempurature readings.  This avoids issues with reading spikes
@@ -112,36 +142,20 @@ def getAverageTempFromQue(temp, name):
         retTemp = sum(heatBedTempQue)/len(heatBedTempQue);
     return float(retTemp);
 
-#this function gets the rise time from a pin(thermistor pin) from the 555 timer out and cross reference with 
-#tempurature table to return the estimated current temperature of the cooresponding heater.
-def getTempFromTable(pin):
-    pulseHighTime = get555PulseHighTime(pin);
-    estTemp = 0;
-    #read from tempurate text file and return estimated temp from pulse time
-    linectr = 0;
-    for lines in open('Thermistor555TimerTempChart.txt','r'):
-        if linectr > 5:
-            lineSplit = lines.split();
-            if float(lineSplit[2]) <= pulseHighTime:
-                estTemp = lineSplit[1];
-                break
-        linectr += 1;
-        #if estTemp == 0: #causing temp sensing error
-            #estTemp = 250; #more than max temp
-    return float(estTemp);
-
 #polling tempurature and setting to +/- 20degC of supplied tempfrom GCode
 def checkTemps():
-	curExtTemp = getAverageTempFromQue(getTempFromTable(ExtThermistor), "Extruder");#getTempFromTable(ExtThermistor);
-	curHeatBedTemp = getAverageTempFromQue(getTempFromTable(HeatBedThermistor), "HeatBed");#getTempFromTable(HeatBedThermistor);
-	if (curExtTemp - 10) >= extTemp:
-		GPIO.output(ExtHeater, False);
-	elif(curExtTemp + 10) <= extTemp:
-		GPIO.output(ExtHeater, True);
-	if (curHeatBedTemp - 10) >= heatBedTemp:
-		GPIO.output(HeatBed, False);
-	elif(curHeatBedTemp + 10) <= heatBedTemp:
-		GPIO.output(HeatBed, True);
+    curExtTemp = getAverageTempFromQue(getTempAtADCChannel(extChannel), "Extruder");#getTempFromTable(ExtThermistor);
+    curHeatBedTemp = getAverageTempFromQue(getTempAtADCChannel(heatBedChannel), "HeatBed");#getTempFromTable(HeatBedThermistor);
+    print "Current Extruder temp: "+ curExtTemp;
+    print "Current HeatBed temp: " + curHeatBedTemp;
+    if curExtTemp >= extTemp:
+        GPIO.output(ExtHeater, False);
+    elif curExtTemp <= extTemp:
+        GPIO.output(ExtHeater, True);
+    if (curHeatBedTemp - 2) >= heatBedTemp:
+        GPIO.output(HeatBed, False);
+    elif(curHeatBedTemp + 2) <= heatBedTemp:
+        GPIO.output(HeatBed, True);
 
 def PenOff(ZMotor):
     # move ZAxis ~5 steps up
@@ -328,7 +342,7 @@ try:#read and execute G code
             print 'Homing Z axis...';
             homeAxis(MZ,EndStopZ)
             
-        elif lines[0:3]=='M05':
+        elif lines[0:3]=='M05': # these will not be used (M05) for the 3D Printer,  I used this code for a pen plotter orginally but I could be used to attach a milling tool
             PenOff(MZ)
             #GPIO.output(Laser_switch,False);
             print 'Pen turned off';
@@ -348,7 +362,7 @@ try:#read and execute G code
             extTemp = float(SinglePosition(lines,'S'));
             print 'Extruder Heater On and setting temperature to '+ str(extTemp) +'C';
             GPIO.output(ExtHeater,True);
-            sampleHeaters(ExtThermistor,HeatBedThermistor);
+            sampleHeaters(0,1);
         elif lines[0:4]=='M106': #Fan on 
             #for now we will just print the following text
             print 'Fan On';
@@ -366,11 +380,11 @@ try:#read and execute G code
             extTemp = float(SinglePosition(lines,'S'));
             print 'Extruder Heater On and setting temperature to '+ str(extTemp) +'C';
             print 'Waiting to reach target temp...';
-            sampleHeaters(ExtThermistor,HeatBedThermistor);
-            temp = getTempFromTable(ExtThermistor)
+            sampleHeaters(extChannel,heatBedChannel);
+            temp = getTempAtADCChannel(extChannel)
             while temp < extTemp:
             	time.sleep(0.2);
-            	temp = getAverageTempFromQue(getTempFromTable(ExtThermistor), "Extruder");
+            	temp = getAverageTempFromQue(getTempAtADCChannel(extChannel), "Extruder");
             	print str(temp);
             	
         elif lines[0:4]=='M140': #Set Heat Bed Temperature 
@@ -389,11 +403,11 @@ try:#read and execute G code
             print 'HeatBed Heater On';
             print 'Setting HeatBed temperature to '+ str(heatBedTemp) +'C and waiting';
             GPIO.output(HeatBed,True);
-            sampleHeaters(ExtThermistor,HeatBedThermistor);
-            temp = getTempFromTable(HeatBedThermistor)
+            sampleHeaters(extChannel,heatBedChannel);
+            temp = getTempAtADCChannel(heatBedChannel)
             while temp < heatBedTemp:
             	time.sleep(0.2);
-            	temp = getAverageTempFromQue(getTempFromTable(HeatBedThermistor), "HeatBed");
+            	temp = getAverageTempFromQue(getTempAtADCChannel(heatBedChannel), "HeatBed");
             	print str(temp);
             
         elif (lines[0:3]=='G1F')|(lines[0:4]=='G1 F'):
@@ -404,6 +418,10 @@ try:#read and execute G code
                 engraving=False;
             else:
                 engraving=True;
+                #Update F Value(speed) if available 			
+
+            if(lines.find('F') >= 0):
+                speed = (SinglePosition(lines,'F')/60)/min(dx,dy);  #getting F value as mm/min so we need to convert to mm/sec then calc and update speed
 
             if(lines.find('E') < 0 and lines.find('Z') < 0):
                 [x_pos,y_pos]=XYposition(lines);
@@ -412,13 +430,13 @@ try:#read and execute G code
                 ext_pos = SinglePosition(lines,'E');
                 stepsExt = int(round(ext_pos/dext)) - MExt.position;
                 #TODO fix this extMotor Delay
-                Motor_control_new.Single_Motor_Step(MExt,stepsExt,30);
+                Motor_control_new.Single_Motor_Step(MExt,stepsExt,speed);
                 #still need to move Extruder using stepExt(signed int)
             elif(lines.find('X') < 0 and lines.find('E') < 0): #Z Axis only
                 print 'Moving Z axis only';
                 z_pos = SinglePosition(lines,'Z');
                 stepsZ = int(round(z_pos/dz)) - MZ.position;
-                Motor_control_new.Single_Motor_Step(MZ,stepsZ,60);
+                Motor_control_new.Single_Motor_Step(MZ,stepsZ,speed);
                 #check Extruder and Heat Bed temp after Z axiz move
                 checkTemps();
             else:                
@@ -484,9 +502,10 @@ try:#read and execute G code
                		moveto(MX,tmp_x_pos,dx,MY, tmp_y_pos,dy,speed,True);
                	else:
                		movetothree(MX,tmp_x_pos,dx,MY, tmp_y_pos,dy,MExt,MExt.position+extruderMovePerStep,dext,speed,True);
-        if heaterCheck % 5 == 0: #checking every fifth extruder motor move 
-            checkTemps();
+        if heaterCheck >= 5: #checking every fifth extruder motor move 
             print 'Checking Temps';
+            checkTemps();
+            heaterCheck = 0;            
         
 except KeyboardInterrupt:
     pass
@@ -494,7 +513,7 @@ except KeyboardInterrupt:
 #shut off heaters
 GPIO.output(outputs, False);
 #PenOff(MZ);   # turn off laser
-moveto(MX,0,dx,MY,0,dy,50,False);  # move back to Origin
+moveto(MX,0,dx,MY,0,dy,130,False);  # move back to Origin
 
 MX.unhold();
 MY.unhold();

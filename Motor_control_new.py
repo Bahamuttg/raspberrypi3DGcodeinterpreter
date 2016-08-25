@@ -11,7 +11,7 @@ def sign(a): #return the sign of number a
     else:
         return 0
 
-def Single_Motor_Step(stepper, step, speed=50):
+def Single_Motor_Step(stepper, step, speed=100):
 #   control stepper motor 1 and 2 simultaneously
 #   stepper1 and stepper2 are objects of Bipolar_Stepper_Motor class
 #   direction is reflected in the polarity of [step1] or [step2]
@@ -20,9 +20,9 @@ def Single_Motor_Step(stepper, step, speed=50):
 
     step = abs(step)
 
-    T = step / speed      #total time
-    dt = T / step                #time delay every micro_step
-    stepper.move(dir1,step,dt) # don't pass dt here, not working for Z Axis have to figure out why?
+    #T = step / speed      #total time
+    #dt = T / step                #time delay every micro_step
+    stepper.move(dir1,step,1/speed) # don't pass dt here, not working for Z Axis have to figure out why?
     
     return 0
     
